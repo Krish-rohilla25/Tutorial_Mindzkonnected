@@ -5,3 +5,4 @@ langchain-groq
 python-dotenv
 langchain-google-genai
 langchain_tavily
+deepagents

@@ -3,8 +3,9 @@ name = "langchain-basic"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
+    "deepagents>=0.6.6",
     "ipykernel>=6.29.5",
     "langchain>=0.0.27",
     "langchain-community>=0.4.1",
