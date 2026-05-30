@@ -6,3 +6,8 @@ python-dotenv
 langchain-google-genai
 langchain_tavily
 deepagents
+pymupdf
+pypdf
+sentence-transformers
+chromadb
+scikit-learn

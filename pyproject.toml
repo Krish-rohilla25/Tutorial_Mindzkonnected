@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "chromadb>=1.5.9",
     "deepagents>=0.6.6",
     "ipykernel>=6.29.5",
     "langchain>=0.0.27",
@@ -13,5 +14,9 @@ dependencies = [
     "langchain-groq>=1.1.2",
     "langchain-openai>=1.2.2",
     "langchain-tavily>=0.2.18",
+    "pymupdf>=1.27.2.3",
+    "pypdf>=6.12.2",
     "python-dotenv>=1.2.2",
+    "scikit-learn>=1.8.0",
+    "sentence-transformers>=5.5.1",
 ]
