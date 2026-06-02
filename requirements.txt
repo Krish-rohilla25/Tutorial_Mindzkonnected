@@ -12,4 +12,7 @@ sentence-transformers
 chromadb
 scikit-learn
 cohere
+pymongo
+mongomock
+
 
