@@ -14,5 +14,6 @@ scikit-learn
 cohere
 pymongo
 mongomock
+streamlit
 
 
