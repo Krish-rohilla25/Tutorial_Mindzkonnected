@@ -15,5 +15,7 @@ cohere
 pymongo
 mongomock
 streamlit
+neo4j
+langchain_experimental
 
 
