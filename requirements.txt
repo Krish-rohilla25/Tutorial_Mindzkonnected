@@ -17,5 +17,8 @@ mongomock
 streamlit
 neo4j
 langchain_experimental
+fastapi
+uvicorn
+faiss-cpu
 
 
