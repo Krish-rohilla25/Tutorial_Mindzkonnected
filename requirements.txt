@@ -20,5 +20,7 @@ langchain_experimental
 fastapi
 uvicorn
 faiss-cpu
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-mongodb
 
 
