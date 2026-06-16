@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 data/
+# ChromaDB generated files (auto-created at runtime)
+chroma_db/
+# PDF files
+*.pdf
