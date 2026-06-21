@@ -8,6 +8,8 @@ langchain_tavily
 deepagents
 pymupdf
 pypdf
+pdf2image
+pytesseract
 sentence-transformers
 chromadb
 scikit-learn

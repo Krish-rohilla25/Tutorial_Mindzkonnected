@@ -41,9 +41,9 @@ st.sidebar.markdown("---")
 pdf_type = st.sidebar.selectbox("PDF Type", ["Normal PDF", "Scanned PDF"])
 
 if pdf_type == "Scanned PDF":
-    st.sidebar.warning(
-        "Scanned PDF support is not available yet. "
-        "Please upload a normal (text-based) PDF for now."
+    st.sidebar.info(
+        "Scanned PDF uses OCR to extract text. "
+        "Processing may take longer than normal PDFs."
     )
 
 st.sidebar.markdown("---")
@@ -87,44 +87,46 @@ if uploaded_file:
         process_button = st.button("Process PDF")
 
     if process_button:
-        if pdf_type == "Scanned PDF":
-            st.error("Scanned PDF support is not available yet. Please select Normal PDF.")
-        else:
-            with st.spinner("Reading and processing the PDF... this may take a moment for large files."):
+        pdf_type_key = "normal" if pdf_type == "Normal PDF" else "scanned"
+        spinner_msg = (
+            "Reading and processing the PDF... this may take a moment for large files."
+            if pdf_type_key == "normal"
+            else "Running OCR on scanned PDF... this may take several minutes."
+        )
 
-                # Save uploaded file to a temp file on disk so PyMuPDF can read it
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
+        with st.spinner(spinner_msg):
 
-                # Extract text
-                raw_text = load_pdf(tmp_path, pdf_type="normal")
+            # Save uploaded file to a temp file on disk so PyMuPDF can read it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.read())
+                tmp_path = tmp.name
 
-                # Split into chunks
-                chunks = split_text(raw_text)
+            raw_text = load_pdf(tmp_path, pdf_type=pdf_type_key)
 
-                # Load embedding model 
-                if st.session_state.embedder is None:
-                    st.session_state.embedder = get_embedder()
+            chunks = split_text(raw_text)
 
-                # Embed chunks
-                embeddings = embed_chunks(chunks, st.session_state.embedder)
+            # Load embedding model
+            if st.session_state.embedder is None:
+                st.session_state.embedder = get_embedder()
 
-                # Build vector store
-                collection = build_vector_store(chunks, embeddings)
+    
+            embeddings = embed_chunks(chunks, st.session_state.embedder)
 
-                # Store in session state
-                st.session_state.collection = collection
-                st.session_state.pdf_processed = True
-                st.session_state.pdf_name = uploaded_file.name
-                st.session_state.chat_history = []
+        
+            collection = build_vector_store(chunks, embeddings)
 
-                # Clean up temp file
-                os.unlink(tmp_path)
+            # Store in session state
+            st.session_state.collection = collection
+            st.session_state.pdf_processed = True
+            st.session_state.pdf_name = uploaded_file.name
+            st.session_state.chat_history = []
 
-            st.success(
-                f"PDF processed. {len(chunks)} chunks created. You can now ask questions."
-            )
+            # Clean up temp file
+            os.unlink(tmp_path)
+
+        st.success(
+            f"PDF processed. {len(chunks)} chunks created. You can now ask questions."
+        )
 
 
 # --- Chat Interface ---
@@ -145,7 +147,7 @@ if st.session_state.pdf_processed:
         if not api_key:
             st.error("Please enter your API key in the sidebar before asking questions.")
         else:
-            # Show the user message immediately
+            # user message
             with st.chat_message("user"):
                 st.write(user_question)
 

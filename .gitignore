@@ -13,3 +13,4 @@ data/
 chroma_db/
 # PDF files
 *.pdf
+ocr_debug.txt

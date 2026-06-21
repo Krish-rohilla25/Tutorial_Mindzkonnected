@@ -22,30 +22,39 @@ def load_normal_pdf(file_path):
 
 def load_scanned_pdf(file_path):
     """
-    Placeholder for scanned PDF support.
-    Scanned PDFs are image-based, so they need OCR to extract text.
+    Load a scanned (image-based) PDF and extract text using OCR.
 
-    To implement this in the future:
-    1. Install: pip install pytesseract pdf2image
-    2. Also install Tesseract OCR on your system (brew install tesseract on mac)
-    3. Use pdf2image to convert each PDF page to an image
-    4. Use pytesseract.image_to_string() on each image
-    5. Concatenate and return the text
+    Uses pdf2image to convert each page to a high-resolution image, applies
+    grayscale + contrast preprocessing using PIL, then runs pytesseract OCR.
+    Higher DPI and preprocessing significantly improve accuracy on letterheads,
+    stamps, and mixed-layout scanned documents.
 
-    Example:
-        from pdf2image import convert_from_path
-        import pytesseract
-
-        pages = convert_from_path(file_path)
-        all_text = ""
-        for page in pages:
-            all_text += pytesseract.image_to_string(page)
-        return all_text
+    Returns a single string with all the OCR-extracted text.
     """
-    raise NotImplementedError(
-        "Scanned PDF support is not available yet. "
-        "Please upload a normal (text-based) PDF."
-    )
+    from pdf2image import convert_from_path
+    import pytesseract
+    from PIL import ImageFilter, ImageEnhance
+
+    pages = convert_from_path(file_path, dpi=300)
+    all_text = ""
+
+    for page in pages:
+        page = page.convert("L")
+
+        page = ImageEnhance.Contrast(page).enhance(2.0)
+
+        page = page.filter(ImageFilter.SHARPEN)
+
+        text = pytesseract.image_to_string(page)
+        all_text += text + "\n"
+
+    # Save raw OCR output to a file for debugging
+    debug_path = "./rag_application/ocr_debug.txt"
+    with open(debug_path, "w", encoding="utf-8") as f:
+        f.write(all_text)
+
+    return all_text
+
 
 
 def load_pdf(file_path, pdf_type="normal"):
@@ -59,3 +68,4 @@ def load_pdf(file_path, pdf_type="normal"):
         return load_scanned_pdf(file_path)
     else:
         raise ValueError(f"Unknown pdf_type: {pdf_type}. Use 'normal' or 'scanned'.")
+

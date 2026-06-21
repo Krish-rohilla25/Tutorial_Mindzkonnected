@@ -15,8 +15,6 @@ def build_vector_store(chunks, embeddings):
     """
     client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-    # Delete all existing collections via the ChromaDB API before creating a
-    # new one. This clears both disk and the Rust backend's in-memory registry.
     for col in client.list_collections():
         client.delete_collection(name=col.name)
 
