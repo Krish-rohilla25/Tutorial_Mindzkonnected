@@ -18,7 +18,7 @@ class Strategy(BaseModel):
     content_type: str = Field(description='"new_post" or "reply"')
     key_points: list[str] = Field(description="2-3 bullet points of what the content should cover")
     caution: str = Field(description="Any warnings (e.g. strict self-promo rules)")
-    skip: bool = Field(description="Set to true if this opportunity should be dropped")
+    skip: bool = Field(default=False, description="Set to true if this opportunity should be dropped")
 
 class StrategyList(BaseModel):
     strategies: list[Strategy]

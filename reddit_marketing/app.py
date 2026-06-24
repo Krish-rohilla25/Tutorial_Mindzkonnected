@@ -347,27 +347,17 @@ with tab2:
             opp_type_label = {
                 "new_post": " New Post",
                 "reply_post": "Reply to Thread",
-                "reply_comment": "Reply to Top Comment",
             }.get(opp_type, "Reply to Thread")
 
             clean_sub = sub.lstrip("r/") if sub.startswith("r/") else sub
-            source_badge = "RSS" if opp.get('source') == 'rss' else ("Comments" if opp.get('source') == 'tavily_comments' else "Post")
             published_badge = " Published" if url in published_urls else ""
 
             with st.expander(f"{score_color} [{score}/30] r/{clean_sub} — {title}{published_badge}"):
-                st.write(f"**Type:** {opp_type_label} | {source_badge}")
+                st.write(f"**Type:** {opp_type_label}")
                 st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | "
                          f"**Intent:** {opp.get('intent', '?')}/10 | "
                          f"**Freshness:** {opp.get('freshness', '?')}/10")
                 st.write(f"**Reasoning:** {reasoning}")
-
-                top_comments = opp.get("top_comments", [])
-                if top_comments:
-                    with st.expander(f"{len(top_comments)} top comment(s) found"):
-                        for tc in top_comments:
-                            st.markdown(f"> {tc.get('body', '')}")
-                            st.caption(f"Score: {tc.get('score', '?')} upvotes")
-                            st.markdown("---")
 
                 if url:
                     st.write(f"[Open on Reddit]({url})")
@@ -414,8 +404,12 @@ with tab3:
     else:
         # Collect selected opportunities
         selected = []
+        published_urls = st.session_state.published_urls
         for i, opp in enumerate(st.session_state.discovery_results):
-            if st.session_state.get(f"select_{i}", True):
+            if opp.get("url") in published_urls:
+                continue
+            is_new = opp.get("url") in st.session_state.new_opportunity_urls
+            if st.session_state.get(f"select_{i}", is_new):
                 selected.append(opp)
 
         st.write(f"**{len(selected)} opportunities selected** for strategy planning.")
@@ -562,9 +556,9 @@ with tab3:
                 raw_sub = draft.get("subreddit", "unknown")
                 clean_sub = raw_sub.lstrip("r/") if raw_sub.startswith("r/") else raw_sub
                 type_emoji = "" if draft_type == "post" else ""
-                approved_key = f"approved_{i}"
-                edit_key = f"editing_{i}"
-                is_approved = st.session_state.get(approved_key, False) or draft.get("approved", False)
+                url_id = draft.get("opportunity", {}).get("url", str(i))
+                edit_key = f"editing_{url_id}"
+                is_approved = draft.get("approved", False)
 
                 # Section headers
                 if i == 0 and is_new_draft:
@@ -583,8 +577,8 @@ with tab3:
                         pass
 
                 draft_title = draft.get("title", "Draft")
-                published_badge = " Published" if draft.get("published", False) else ""
-                expander_label = f"{type_emoji} r/{clean_sub} — {draft_title[:70]}{published_badge}"
+                published_badge = " ✓ Published" if draft.get("published", False) else ""
+                expander_label = f"{type_emoji} r/{clean_sub} — {draft_title[:60]}{published_badge}"
 
                 with st.expander(expander_label, expanded=not is_approved):
                     if draft_type == "post":
@@ -601,8 +595,7 @@ with tab3:
                         col1, col2, col3 = st.columns(3)
 
                         with col1:
-                            if st.button("Approve", key=f"approve_btn_{i}", type="primary"):
-                                st.session_state[approved_key] = True
+                            if st.button("Approve", key=f"approve_btn_{url_id}", type="primary"):
                                 st.session_state.drafts[i]["approved"] = True
                                 save_current_state()
                                 st.rerun()
@@ -610,19 +603,19 @@ with tab3:
                         with col2:
                             is_editing = st.session_state.get(edit_key, False)
                             edit_label = "Done Editing" if is_editing else "Edit"
-                            if st.button(edit_label, key=f"edit_btn_{i}"):
+                            if st.button(edit_label, key=f"edit_btn_{url_id}"):
                                 st.session_state[edit_key] = not is_editing
                                 st.rerun()
                             if is_editing:
-                                new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{i}")
+                                new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{url_id}")
                                 st.session_state.drafts[i]["body"] = new_body
-                                if st.button("Save edits", key=f"save_edit_{i}"):
+                                if st.button("Save edits", key=f"save_edit_{url_id}"):
                                     st.session_state[edit_key] = False
                                     save_current_state()
                                     st.rerun()
 
                         with col3:
-                            if st.button("Reject", key=f"reject_btn_{i}"):
+                            if st.button("Reject", key=f"reject_btn_{url_id}"):
                                 # Mark rejected and delete strategy for this opportunity
                                 draft_url = draft.get("opportunity", {}).get("url", "")
                                 st.session_state.drafts[i]["rejected"] = True
@@ -648,10 +641,8 @@ with tab4:
         # Collect approved drafts
         approved_drafts = []
         for i, draft in enumerate(st.session_state.drafts):
-            # Check both session state key AND the persisted draft field (survives page reload)
-            is_approved = st.session_state.get(f"approved_{i}", False) or draft.get("approved", False)
             if (
-                is_approved
+                draft.get("approved", False)
                 and not draft.get("rejected", False)
                 and not draft.get("published", False)
             ):
@@ -688,10 +679,10 @@ with tab4:
                         action_text = "Copy & Open Reddit Thread"
 
                     col1, col2 = st.columns(2)
+                    url_id = opp.get("url", str(i))
 
                     with col1:
-                        publish_key = f"published_{i}"
-                        if st.button(f"{action_text}", key=f"pub_btn_{i}", type="primary"):
+                        if st.button(f"{action_text}", key=f"pub_btn_{url_id}", type="primary"):
                             # Copy content and open browser
                             content_to_copy = body
                             if draft_type == "post":
@@ -705,7 +696,6 @@ with tab4:
                                 draft_url = draft.get("opportunity", {}).get("url", "")
                                 if draft_url:
                                     st.session_state.published_urls.add(draft_url)
-                                st.session_state[publish_key] = True
                                 storage.log_published(
                                     st.session_state.project_name, 
                                     reddit_url, 
@@ -719,8 +709,10 @@ with tab4:
                             else:
                                 st.warning("Couldn't copy to clipboard. Opening Reddit anyway...")
                                 st.link_button("Open Reddit Link", reddit_url)
-                                if st.button("Mark as Published (Manual)"):
-                                    st.session_state[publish_key] = True
+                                if st.button("Mark as Published (Manual)", key=f"manual_pub_{url_id}"):
+                                    st.session_state.drafts[i]["published"] = True
+                                    if draft_url:
+                                        st.session_state.published_urls.add(draft_url)
                                     storage.log_published(
                                         st.session_state.project_name, 
                                         reddit_url, 
@@ -728,14 +720,14 @@ with tab4:
                                         draft_type, 
                                         sub
                                     )
+                                    save_current_state()
                                     st.rerun()
-                                st.session_state[publish_key] = True
 
                     with col2:
                         st.link_button("Open Reddit Link", reddit_url)
 
                     # Status
-                    if draft.get("published", False) or st.session_state.get(f"published_{i}", False):
+                    if draft.get("published", False):
                         st.success("Sent to Reddit!")
 
     # Published history
@@ -744,9 +736,8 @@ with tab4:
     published_count = sum(1 for d in st.session_state.drafts if d.get("published", False))
     total_drafts = len(st.session_state.drafts)
     approved_count = sum(
-        1 for i, d in enumerate(st.session_state.drafts)
-        if (st.session_state.get(f"approved_{i}", False) or d.get("approved", False))
-        and not d.get("rejected", False)
+        1 for d in st.session_state.drafts
+        if d.get("approved", False) and not d.get("rejected", False)
     )
 
     col1, col2, col3 = st.columns(3)
