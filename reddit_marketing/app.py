@@ -267,12 +267,34 @@ with tab2:
     st.subheader("Find Reddit Opportunities")
     st.write("The Discovery Agent searches Reddit for posts where your product can genuinely help.")
 
-    # Optional extra queries
-    extra = st.text_input(
-        "Extra search queries (optional, comma-separated)",
-        placeholder="e.g. best study apps, AI flashcard maker",
+    st.markdown("### 1. Generate Search Queries")
+    st.write("First, let the AI generate search queries based on your project brief, or write your own.")
+
+    if st.button("Generate Search Queries"):
+        if not api_key:
+            st.error("Please set the LLM API key in the sidebar.")
+        else:
+            with st.spinner("Generating..."):
+                try:
+                    from reddit_marketing.agents.discovery import generate_search_queries
+                    llm = get_llm(provider, model_name, api_key)
+                    queries = generate_search_queries(llm, st.session_state.brief)
+                    st.session_state.search_queries = queries
+                    save_current_state()
+                except Exception as e:
+                    st.error(f"Failed to generate queries: {e}")
+
+    # Editable queries area
+    current_queries = "\n".join(st.session_state.get("search_queries", []))
+    edited_queries_text = st.text_area(
+        "Search Queries (one per line)",
+        value=current_queries,
+        height=150,
+        placeholder="AI-powered workout apps\nbest fitness tracker 2024"
     )
-    extra_queries = [q.strip() for q in extra.split(",") if q.strip()] if extra else None
+
+    st.markdown("---")
+    st.markdown("### 2. Find Opportunities")
 
     col_opts1, col_opts2 = st.columns(2)
     with col_opts1:
@@ -288,23 +310,28 @@ with tab2:
     tr_param = None if time_range == "all" else time_range
 
     st.write("") # spacer
-    run_discovery_btn = st.button("Run Discovery", type="primary")
+    run_discovery_btn = st.button("Find Opportunities", type="primary")
 
     if run_discovery_btn:
-        if not api_key or not tavily_key:
+        final_queries = [q.strip() for q in edited_queries_text.split("\n") if q.strip()]
+        
+        if not final_queries:
+            st.error("Please provide at least one search query.")
+        elif not api_key or not tavily_key:
             st.error("Please set both LLM and Tavily API keys in the sidebar.")
         else:
-            with st.spinner("Generating search queries and scanning Reddit..."):
+            with st.spinner(f"Scanning Reddit for {len(final_queries)} queries..."):
                 try:
+                    # Update saved queries with user's edits
+                    st.session_state.search_queries = final_queries
+                    
                     llm = get_llm(provider, model_name, api_key)
 
-                    queries, results = run_discovery(
-                        llm, tavily_key, st.session_state.brief, extra_queries,
+                    results = run_discovery(
+                        llm, tavily_key, st.session_state.brief, final_queries,
                         max_results_per_query=5, time_range=tr_param
                     )
 
-                    st.session_state.search_queries = queries
-                    
                     # Merge new results on top, keeping old ones below (deduplicate by URL)
                     existing = st.session_state.discovery_results
                     existing_urls = {o.get("url") for o in existing}
@@ -316,8 +343,6 @@ with tab2:
 
                 except Exception as e:
                     st.error(f"Discovery failed: {str(e)}")
-
-    # Show search queries used
     if st.session_state.search_queries:
         with st.expander(f" Search queries used ({len(st.session_state.search_queries)})"):
             for q in st.session_state.search_queries:
@@ -340,7 +365,7 @@ with tab2:
             opp_type = opp.get("opportunity_type", "reply")
 
             if isinstance(score, (int, float)):
-                score_color = "🟢" if score >= 24 else ("🟡" if score >= 18 else "🔴")
+                score_color = "🟢" if score >= 16 else ("🟡" if score >= 12 else "🔴")
             else:
                 score_color = "⚪"
 
@@ -352,11 +377,10 @@ with tab2:
             clean_sub = sub.lstrip("r/") if sub.startswith("r/") else sub
             published_badge = " Published" if url in published_urls else ""
 
-            with st.expander(f"{score_color} [{score}/30] r/{clean_sub} — {title}{published_badge}"):
+            with st.expander(f"{score_color} [{score}/20] r/{clean_sub} — {title}{published_badge}"):
                 st.write(f"**Type:** {opp_type_label}")
                 st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | "
-                         f"**Intent:** {opp.get('intent', '?')}/10 | "
-                         f"**Freshness:** {opp.get('freshness', '?')}/10")
+                         f"**Intent:** {opp.get('intent', '?')}/10")
                 st.write(f"**Reasoning:** {reasoning}")
 
                 if url:
@@ -592,7 +616,7 @@ with tab3:
                         # Approved: just show status, no other buttons
                         st.success("Approved — move to Publish tab.")
                     else:
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
 
                         with col1:
                             if st.button("Approve", key=f"approve_btn_{url_id}", type="primary"):
@@ -605,16 +629,18 @@ with tab3:
                             edit_label = "Done Editing" if is_editing else "Edit"
                             if st.button(edit_label, key=f"edit_btn_{url_id}"):
                                 st.session_state[edit_key] = not is_editing
+                                st.session_state[f"show_regen_{url_id}"] = False
                                 st.rerun()
-                            if is_editing:
-                                new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{url_id}")
-                                st.session_state.drafts[i]["body"] = new_body
-                                if st.button("Save edits", key=f"save_edit_{url_id}"):
-                                    st.session_state[edit_key] = False
-                                    save_current_state()
-                                    st.rerun()
 
                         with col3:
+                            is_regen = st.session_state.get(f"show_regen_{url_id}", False)
+                            regen_label = "Cancel Regen" if is_regen else "Regenerate"
+                            if st.button(regen_label, key=f"regen_btn_{url_id}"):
+                                st.session_state[f"show_regen_{url_id}"] = not is_regen
+                                st.session_state[edit_key] = False
+                                st.rerun()
+
+                        with col4:
                             if st.button("Reject", key=f"reject_btn_{url_id}"):
                                 # Mark rejected and delete strategy for this opportunity
                                 draft_url = draft.get("opportunity", {}).get("url", "")
@@ -626,6 +652,29 @@ with tab3:
                                 ]
                                 save_current_state()
                                 st.rerun()
+
+                        if st.session_state.get(edit_key, False):
+                            new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{url_id}")
+                            st.session_state.drafts[i]["body"] = new_body
+                            if st.button("Save edits", key=f"save_edit_{url_id}"):
+                                st.session_state[edit_key] = False
+                                save_current_state()
+                                st.rerun()
+
+                        if st.session_state.get(f"show_regen_{url_id}", False):
+                            suggestion = st.text_area("How should we improve this draft?", placeholder="e.g. Make it shorter, focus more on feature X...", key=f"regen_input_{url_id}")
+                            if st.button("Generate New Draft", key=f"do_regen_{url_id}"):
+                                with st.spinner("Regenerating draft based on feedback..."):
+                                    from reddit_marketing.agents.content import generate_draft
+                                    try:
+                                        llm = get_llm(provider, model_name, api_key)
+                                        new_draft = generate_draft(llm, st.session_state.brief, draft.get("opportunity"), feedback=suggestion)
+                                        st.session_state.drafts[i] = new_draft
+                                        st.session_state[f"show_regen_{url_id}"] = False
+                                        save_current_state()
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to regenerate: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════

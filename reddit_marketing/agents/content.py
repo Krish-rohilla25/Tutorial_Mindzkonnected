@@ -50,28 +50,34 @@ def _clean_subreddit(sub: str) -> str:
     return sub
 
 
-def generate_draft(llm, brief, opportunity):
+def generate_draft(llm, brief, opportunity, feedback=None):
     """
     Generate a reply draft for a Reddit thread.
 
     opportunity: dict with strategy fields + original post content
+    feedback: optional user feedback to improve the draft
     Returns a draft dict: {body, context, opportunity, draft_type, subreddit, title}
     """
+    human_content = (
+        f"Product Brief:\n{brief.to_prompt_str()}\n\n"
+        f"Thread context:\n"
+        f"Subreddit: r/{_clean_subreddit(opportunity.get('subreddit', 'unknown'))}\n"
+        f"Post Title: {opportunity.get('title', 'N/A')}\n"
+        f"Post URL: {opportunity.get('url', 'N/A')}\n"
+        f"Post preview: {opportunity.get('content', '')[:300]}\n"
+        f"\nYour Angle: {opportunity.get('angle', 'helpful_tip')}\n"
+        f"Approach: {opportunity.get('approach', 'Be helpful and natural')}\n"
+        f"Key Points to work in naturally:\n"
+        + "\n".join(f"- {p}" for p in opportunity.get("key_points", []))
+        + f"\n\nCaution: {opportunity.get('caution', 'None')}"
+    )
+
+    if feedback:
+        human_content += f"\n\nUSER FEEDBACK ON PREVIOUS DRAFT:\nThe user rejected the previous draft and provided this feedback to improve it:\n\"{feedback}\"\n\nPlease write a completely new draft that strictly incorporates this feedback."
+
     messages = [
         SystemMessage(content=REPLY_SYSTEM_PROMPT),
-        HumanMessage(content=(
-            f"Product Brief:\n{brief.to_prompt_str()}\n\n"
-            f"Thread context:\n"
-            f"Subreddit: r/{_clean_subreddit(opportunity.get('subreddit', 'unknown'))}\n"
-            f"Post Title: {opportunity.get('title', 'N/A')}\n"
-            f"Post URL: {opportunity.get('url', 'N/A')}\n"
-            f"Post preview: {opportunity.get('content', '')[:300]}\n"
-            f"\nYour Angle: {opportunity.get('angle', 'helpful_tip')}\n"
-            f"Approach: {opportunity.get('approach', 'Be helpful and natural')}\n"
-            f"Key Points to work in naturally:\n"
-            + "\n".join(f"- {p}" for p in opportunity.get("key_points", []))
-            + f"\n\nCaution: {opportunity.get('caution', 'None')}"
-        )),
+        HumanMessage(content=human_content),
     ]
 
     try:

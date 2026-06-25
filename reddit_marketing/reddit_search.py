@@ -57,6 +57,9 @@ def search_reddit(tavily_api_key: str, query: str, max_results: int = 10, time_r
     tool = _get_tavily_tool(tavily_api_key, max_results, time_range)
     result = tool.invoke(query)
 
+    if isinstance(result, dict) and "error" in result:
+        raise Exception(f"Tavily API Error: {result['error']}")
+
     opportunities = []
     for r in result.get("results", []):
         url = r.get("url", "")

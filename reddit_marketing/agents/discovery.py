@@ -19,7 +19,6 @@ class ScoredOpportunity(BaseModel):
     subreddit: str = Field(description="Subreddit name only — NO r/ prefix")
     relevance: int
     intent: int
-    freshness: int
     total_score: int
     reasoning: str
     opportunity_type: str = Field(description="'new_post' or 'reply_post'")
@@ -35,17 +34,9 @@ You will receive:
 1. A project brief describing the product.
 2. A list of Reddit posts/threads found via search.
 
-For each item, score it on three dimensions (0-10):
+For each item, score it on two dimensions (0-10):
 - **relevance**: How related is this post/comment to the product?
 - **intent**: Is someone asking for help, recommendations, or solutions that the product could address?
-- **freshness**: Grade STRICTLY based on timestamps visible in the text (e.g., "1d ago", "18 days ago"). Use this scale: 
-  - Within 24 hours = 10
-  - 2 to 3 days ago = 9
-  - 4 to 7 days ago = 8
-  - 1 to 2 weeks ago = 6
-  - 3 to 4 weeks ago = 4
-  - Older than 1 month = 2
-  - If no timestamp is visible anywhere, default to 7.
 
 Also provide:
 - **reasoning**: A one-sentence explanation of why this is (or isn't) a good opportunity.
@@ -62,12 +53,11 @@ Respond by strictly following the requested JSON schema. Each opportunity must h
 - subreddit: subreddit name only — NO r/ prefix
 - relevance: 0-10
 - intent: 0-10
-- freshness: 0-10
-- total_score: sum of the above (0-30)
+- total_score: sum of the above (0-20)
 - reasoning: one-sentence explanation
 - opportunity_type: "new_post" or "reply_post"
 
-Sort your internal list by total_score descending. Only include opportunities with total_score >= 12."""
+Sort your internal list by total_score descending. Only include opportunities with total_score >= 8."""
 
 
 def _clean_subreddit(sub: str) -> str:
@@ -141,31 +131,26 @@ def score_opportunities(llm, brief, raw_opportunities):
 
         # Safety net: recompute total_score from sub-scores in case AI gets it wrong
         for item in scored:
-            item["total_score"] = item.get("relevance", 0) + item.get("intent", 0) + item.get("freshness", 0)
+            item["total_score"] = item.get("relevance", 0) + item.get("intent", 0)
             if "subreddit" in item:
                 item["subreddit"] = _clean_subreddit(item["subreddit"])
 
-        filtered = [s for s in scored if s.get("total_score", 0) >= 12]
+        filtered = [s for s in scored if s.get("total_score", 0) >= 8]
         return sorted(filtered, key=lambda x: x.get("total_score", 0), reverse=True)
     except Exception as e:
         print(f"Error scoring opportunities: {e}")
         return []
 
 
-def run_discovery(llm, tavily_api_key, brief, extra_queries=None, max_results_per_query=5, time_range="month"):
+def run_discovery(llm, tavily_api_key, brief, queries, max_results_per_query=5, time_range="month"):
     """
-    Full discovery pipeline:
-    1. Generate search queries from the brief.
-    2. Search Reddit via Tavily.
-    3. Score and rank all results.
+    Discovery pipeline:
+    1. Search Reddit via Tavily using provided queries.
+    2. Score and rank all results.
 
-    Returns (queries_used, scored_opportunities).
+    Returns a list of scored_opportunities.
     """
     from reddit_marketing.reddit_search import search_reddit
-
-    queries = generate_search_queries(llm, brief)
-    if extra_queries:
-        queries.extend(extra_queries)
 
     all_results = []
     seen_urls = set()
@@ -182,4 +167,4 @@ def run_discovery(llm, tavily_api_key, brief, extra_queries=None, max_results_pe
                 all_results.append(r)
 
     scored = score_opportunities(llm, brief, all_results)
-    return queries, scored
+    return scored
