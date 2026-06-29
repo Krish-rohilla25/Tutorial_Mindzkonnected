@@ -31,10 +31,15 @@ from reddit_marketing.llm_handler import (
     DEFAULT_PROVIDER,
     DEFAULT_MODEL,
 )
-from reddit_marketing.agents.discovery import run_discovery
+from reddit_marketing.agents.discovery import (
+    run_discovery,
+    run_subreddit_discovery,
+    score_comment_opportunities,
+)
 from reddit_marketing.agents.strategy import plan_strategy
-from reddit_marketing.agents.content import generate_draft
+from reddit_marketing.agents.content import generate_comment_reply_draft, generate_draft
 from reddit_marketing.publisher import copy_and_open, get_submit_url, get_reply_url
+from reddit_marketing.reddit_search import fetch_thread_comments_rss
 from reddit_marketing import storage
 
 # Initialize database
@@ -102,12 +107,14 @@ if st.sidebar.button("Create New Project"):
         st.session_state.brief = get_default_brief()
         st.session_state.brief.brand_name = new_project_name
         st.session_state.discovery_results = []
+        st.session_state.subreddit_results = []
         st.session_state.search_queries = []
         st.session_state.strategy_results = []
         st.session_state.drafts = []
         storage.save_project(new_project_name, st.session_state.brief.__dict__, {
             "search_queries": [],
             "discovery_results": [],
+            "subreddit_results": [],
             "strategy_results": [],
             "drafts": []
         })
@@ -122,13 +129,17 @@ if all_projects:
             st.session_state.brief = ProjectBrief(**brief_dict)
             st.session_state.search_queries = state_dict.get("search_queries", [])
             st.session_state.discovery_results = state_dict.get("discovery_results", [])
+            st.session_state.subreddit_results = state_dict.get("subreddit_results", [])
             st.session_state.strategy_results = state_dict.get("strategy_results", [])
             st.session_state.drafts = state_dict.get("drafts", [])
             # Restore URL sets (stored as lists in DB)
             st.session_state.new_opportunity_urls = set(state_dict.get("new_opportunity_urls", []))
+            st.session_state.new_subreddit_urls = set(state_dict.get("new_subreddit_urls", []))
             st.session_state.new_strategy_urls = set(state_dict.get("new_strategy_urls", []))
             st.session_state.new_draft_urls = set(state_dict.get("new_draft_urls", []))
             st.session_state.published_urls = set(state_dict.get("published_urls", []))
+            st.session_state.monitored_comments = state_dict.get("monitored_comments", [])
+            st.session_state.monitor_reply_drafts = state_dict.get("monitor_reply_drafts", {})
             st.rerun()
 
 st.sidebar.markdown("---")
@@ -147,6 +158,8 @@ if "brief" not in st.session_state:
 
 if "discovery_results" not in st.session_state:
     st.session_state.discovery_results = []
+if "subreddit_results" not in st.session_state:
+    st.session_state.subreddit_results = []
 
 if "search_queries" not in st.session_state:
     st.session_state.search_queries = []
@@ -160,6 +173,8 @@ if "drafts" not in st.session_state:
 # Track which items are "new" (from the latest run) vs "old" (from previous runs)
 if "new_opportunity_urls" not in st.session_state:
     st.session_state.new_opportunity_urls = set()
+if "new_subreddit_urls" not in st.session_state:
+    st.session_state.new_subreddit_urls = set()
 if "new_strategy_urls" not in st.session_state:
     st.session_state.new_strategy_urls = set()
 if "new_draft_urls" not in st.session_state:
@@ -167,31 +182,165 @@ if "new_draft_urls" not in st.session_state:
 # Track which opportunity URLs have been published
 if "published_urls" not in st.session_state:
     st.session_state.published_urls = set()
+if "monitored_comments" not in st.session_state:
+    st.session_state.monitored_comments = []
+if "new_monitored_comment_ids" not in st.session_state:
+    st.session_state.new_monitored_comment_ids = set()
+if "monitor_reply_drafts" not in st.session_state:
+    st.session_state.monitor_reply_drafts = {}
 
 def save_current_state():
     """Helper to dump current state to DB for the active project."""
     state_dict = {
         "search_queries": st.session_state.search_queries,
         "discovery_results": st.session_state.discovery_results,
+        "subreddit_results": st.session_state.subreddit_results,
         "strategy_results": st.session_state.strategy_results,
         "drafts": st.session_state.drafts,
         # Store sets as lists (JSON serializable)
         "new_opportunity_urls": list(st.session_state.new_opportunity_urls),
+        "new_subreddit_urls": list(st.session_state.new_subreddit_urls),
         "new_strategy_urls": list(st.session_state.new_strategy_urls),
         "new_draft_urls": list(st.session_state.new_draft_urls),
         "published_urls": list(st.session_state.published_urls),
+        "monitored_comments": st.session_state.monitored_comments,
+        "new_monitored_comment_ids": list(st.session_state.new_monitored_comment_ids),
+        "monitor_reply_drafts": st.session_state.monitor_reply_drafts,
     }
     storage.save_project(st.session_state.project_name, st.session_state.brief.__dict__, state_dict)
 
 
+
+def render_draft_review_ui(title="Draft Review", allowed_types=None):
+    # Filter drafts first to see if any match allowed_types
+    if allowed_types is not None:
+        relevant_drafts = [d for d in st.session_state.drafts if d.get("draft_type") in allowed_types]
+    else:
+        relevant_drafts = st.session_state.drafts
+
+    if not relevant_drafts:
+        return
+
+    st.markdown("---")
+    st.subheader(title)
+
+    new_draft_urls = st.session_state.new_draft_urls
+
+    for i, draft in enumerate(st.session_state.drafts):
+        if allowed_types is not None and draft.get("draft_type") not in allowed_types:
+            continue
+        if draft.get("rejected", False):
+            continue  # skip already-rejected
+
+        is_new_draft = draft.get("opportunity", {}).get("url") in new_draft_urls
+        draft_type = draft.get("draft_type", "reply")
+        raw_sub = draft.get("subreddit", "unknown")
+        clean_sub = raw_sub.lstrip("r/") if raw_sub.startswith("r/") else raw_sub
+        type_emoji = "" if draft_type == "post" else ""
+        url_id = draft.get("opportunity", {}).get("url", str(i))
+        # Ensure url_id is safe for Streamlit keys
+        import hashlib
+        safe_url_id = hashlib.md5(url_id.encode('utf-8')).hexdigest()
+        edit_key = f"editing_{safe_url_id}"
+        is_approved = draft.get("approved", False)
+
+        raw_body = draft.get("body", "")
+        if isinstance(raw_body, str) and raw_body.strip().startswith("{"):
+            try:
+                import json as _json
+                parsed = _json.loads(raw_body)
+                raw_body = parsed.get("body", raw_body)
+            except Exception:
+                pass
+
+        if draft_type == "comment_reply":
+            comment_body = draft.get("opportunity", {}).get("comment", {}).get("body", "")
+            preview = (comment_body[:60] + "...") if len(comment_body) > 60 else comment_body
+            draft_title = preview.replace("\n", " ").strip() or "Comment Reply"
+        else:
+            draft_title = draft.get("title", "Draft")
+        published_badge = " ✓ Published" if draft.get("published", False) else ""
+        expander_label = f"{type_emoji} r/{clean_sub} — {draft_title[:60]}{published_badge}"
+
+        with st.expander(expander_label, expanded=not is_approved):
+            if draft_type == "post":
+                st.markdown(f"**Title:** {draft_title}")
+                st.markdown("---")
+            st.markdown(raw_body)
+
+            st.markdown("")
+
+            if is_approved:
+                st.success("Approved — move to Publish tab.")
+            else:
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    if st.button("Approve", key=f"approve_btn_{safe_url_id}", type="primary"):
+                        st.session_state.drafts[i]["approved"] = True
+                        save_current_state()
+                        st.rerun()
+
+                with col2:
+                    is_editing = st.session_state.get(edit_key, False)
+                    edit_label = "Done Editing" if is_editing else "Edit"
+                    if st.button(edit_label, key=f"edit_btn_{safe_url_id}"):
+                        st.session_state[edit_key] = not is_editing
+                        st.session_state[f"show_regen_{safe_url_id}"] = False
+                        st.rerun()
+
+                with col3:
+                    is_regen = st.session_state.get(f"show_regen_{safe_url_id}", False)
+                    regen_label = "Cancel Regen" if is_regen else "Regenerate"
+                    if st.button(regen_label, key=f"regen_btn_{safe_url_id}"):
+                        st.session_state[f"show_regen_{safe_url_id}"] = not is_regen
+                        st.session_state[edit_key] = False
+                        st.rerun()
+
+                with col4:
+                    if st.button("Reject", key=f"reject_btn_{safe_url_id}"):
+                        st.session_state.drafts[i]["rejected"] = True
+                        draft_url = draft.get("opportunity", {}).get("url", "")
+                        st.session_state.strategy_results = [
+                            s for s in st.session_state.strategy_results
+                            if s.get("url", "") != draft_url
+                        ]
+                        save_current_state()
+                        st.rerun()
+
+                if st.session_state.get(edit_key, False):
+                    new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{safe_url_id}")
+                    st.session_state.drafts[i]["body"] = new_body
+                    if st.button("Save edits", key=f"save_edit_{safe_url_id}"):
+                        st.session_state[edit_key] = False
+                        save_current_state()
+                        st.rerun()
+
+                if st.session_state.get(f"show_regen_{safe_url_id}", False):
+                    suggestion = st.text_area("How should we improve this draft?", placeholder="e.g. Make it shorter...", key=f"regen_input_{safe_url_id}")
+                    if st.button("Generate New Draft", key=f"do_regen_{safe_url_id}"):
+                        with st.spinner("Regenerating draft based on feedback..."):
+                            from reddit_marketing.agents.content import generate_draft
+                            try:
+                                llm = get_llm(provider, model_name, api_key)
+                                new_draft = generate_draft(llm, st.session_state.brief, draft.get("opportunity"), feedback=suggestion)
+                                st.session_state.drafts[i] = new_draft
+                                st.session_state[f"show_regen_{safe_url_id}"] = False
+                                save_current_state()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to regenerate: {e}")
+
+
 # ── Tabs ─────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Project Brief",
     "Discovery",
     "Strategy & Content",
     "Publish",
-    "History"
+    "History",
+    "Monitor Posts"
 ])
 
 
@@ -264,12 +413,10 @@ with tab5:
 # ═══════════════════════════════════════════════════════════════════════
 
 with tab2:
-    st.subheader("Find Reddit Opportunities")
-    st.write("The Discovery Agent searches Reddit for posts where your product can genuinely help.")
+    st.subheader("Discovery")
+    st.write("Generate search queries from the brief, then choose whether to find subreddits for original posts or threads to reply to.")
 
-    st.markdown("### 1. Generate Search Queries")
-    st.write("First, let the AI generate search queries based on your project brief, or write your own.")
-
+    st.markdown("### 1. Search Queries")
     if st.button("Generate Search Queries"):
         if not api_key:
             st.error("Please set the LLM API key in the sidebar.")
@@ -278,142 +425,152 @@ with tab2:
                 try:
                     from reddit_marketing.agents.discovery import generate_search_queries
                     llm = get_llm(provider, model_name, api_key)
-                    queries = generate_search_queries(llm, st.session_state.brief)
-                    st.session_state.search_queries = queries
+                    st.session_state.search_queries = generate_search_queries(llm, st.session_state.brief)
                     save_current_state()
                 except Exception as e:
                     st.error(f"Failed to generate queries: {e}")
 
-    # Editable queries area
     current_queries = "\n".join(st.session_state.get("search_queries", []))
     edited_queries_text = st.text_area(
         "Search Queries (one per line)",
         value=current_queries,
         height=150,
-        placeholder="AI-powered workout apps\nbest fitness tracker 2024"
+        placeholder="AI-powered workout apps\nbest fitness tracker 2024",
     )
 
     st.markdown("---")
-    st.markdown("### 2. Find Opportunities")
+    st.markdown("### 2. Choose Discovery Mode")
+    discovery_mode = st.radio(
+        "What do you want to find?",
+        ["Find subreddits to post in", "Find threads to reply to"],
+        horizontal=True,
+    )
 
-    col_opts1, col_opts2 = st.columns(2)
+    col_opts1, col_opts2, col_opts3 = st.columns(3)
     with col_opts1:
         time_range = st.selectbox(
-            "Time Range (Find freshest posts)",
+            "Time Range",
             options=["day", "week", "month", "year", "all"],
-            index=2, # defaults to month
-            format_func=lambda x: "Past 24 hours" if x == "day" else f"Past {x}" if x != "all" else "Any time"
+            index=2,
+            format_func=lambda x: "Past 24 hours" if x == "day" else f"Past {x}" if x != "all" else "Any time",
         )
     with col_opts2:
-        max_total = st.slider("Max total opportunities to find", min_value=1, max_value=30, value=10)
+        max_total = st.slider("Max results", min_value=1, max_value=30, value=10)
+    with col_opts3:
+        search_method = st.selectbox(
+            "Search Source",
+            options=["reddit_json", "tavily"],
+            index=0,
+            format_func=lambda x: {
+                "reddit_json": "Reddit JSON",
+                "tavily": "Tavily",
+            }[x],
+        )
+
+    rss_subreddits = []
 
     tr_param = None if time_range == "all" else time_range
-
-    st.write("") # spacer
-    run_discovery_btn = st.button("Find Opportunities", type="primary")
+    run_label = "Find Subreddits" if discovery_mode.startswith("Find subreddits") else "Find Reply Opportunities"
+    run_discovery_btn = st.button(run_label, type="primary")
 
     if run_discovery_btn:
         final_queries = [q.strip() for q in edited_queries_text.split("\n") if q.strip()]
-        
         if not final_queries:
             st.error("Please provide at least one search query.")
-        elif not api_key or not tavily_key:
-            st.error("Please set both LLM and Tavily API keys in the sidebar.")
+        elif not api_key:
+            st.error("Please set the LLM API key in the sidebar.")
+        elif search_method == "tavily" and not tavily_key:
+            st.error("Please set the Tavily API key in the sidebar or switch to Reddit JSON/RSS.")
+        elif search_method == "rss" and not rss_subreddits:
+            st.error("Please provide at least one subreddit for RSS scanning.")
         else:
-            with st.spinner(f"Scanning Reddit for {len(final_queries)} queries..."):
-                try:
-                    # Update saved queries with user's edits
-                    st.session_state.search_queries = final_queries
-                    
-                    llm = get_llm(provider, model_name, api_key)
-
-                    results = run_discovery(
-                        llm, tavily_key, st.session_state.brief, final_queries,
-                        max_results_per_query=5, time_range=tr_param
-                    )
-
-                    # Merge new results on top, keeping old ones below (deduplicate by URL)
-                    existing = st.session_state.discovery_results
-                    existing_urls = {o.get("url") for o in existing}
+            st.session_state.search_queries = final_queries
+            llm = get_llm(provider, model_name, api_key)
+            try:
+                if discovery_mode.startswith("Find subreddits"):
+                    with st.spinner("Finding subreddits for original posts..."):
+                        results = run_subreddit_discovery(
+                            llm,
+                            tavily_key,
+                            st.session_state.brief,
+                            final_queries,
+                            max_results_per_query=5,
+                            time_range=tr_param,
+                            search_method=search_method,
+                            rss_subreddits=rss_subreddits,
+                            max_subreddits=max_total,
+                        )
+                    existing_urls = {o.get("url") for o in st.session_state.subreddit_results}
+                    fresh = [r for r in results if r.get("url") not in existing_urls]
+                    st.session_state.new_subreddit_urls = {r.get("url") for r in fresh}
+                    st.session_state.subreddit_results = fresh + st.session_state.subreddit_results
+                else:
+                    with st.spinner("Finding Reddit threads to reply to..."):
+                        results = run_discovery(
+                            llm,
+                            tavily_key,
+                            st.session_state.brief,
+                            final_queries,
+                            max_results_per_query=5,
+                            time_range=tr_param,
+                            search_method=search_method,
+                            rss_subreddits=rss_subreddits,
+                        )
+                    existing_urls = {o.get("url") for o in st.session_state.discovery_results}
                     fresh = [r for r in results[:max_total] if r.get("url") not in existing_urls]
                     st.session_state.new_opportunity_urls = {r.get("url") for r in fresh}
-                    st.session_state.discovery_results = fresh + existing
-                    
-                    save_current_state()
+                    st.session_state.discovery_results = fresh + st.session_state.discovery_results
+                save_current_state()
+            except Exception as e:
+                st.error(f"Discovery failed: {e}")
 
-                except Exception as e:
-                    st.error(f"Discovery failed: {str(e)}")
     if st.session_state.search_queries:
-        with st.expander(f" Search queries used ({len(st.session_state.search_queries)})"):
+        with st.expander(f"Search queries used ({len(st.session_state.search_queries)})"):
             for q in st.session_state.search_queries:
-                st.write(f"• {q}")
+                st.write(f"- {q}")
 
-    # Show results
-    if st.session_state.discovery_results:
-        new_urls = st.session_state.new_opportunity_urls
-        published_urls = st.session_state.published_urls
-
-        new_opps = [o for o in st.session_state.discovery_results if o.get("url") in new_urls]
-        old_opps = [o for o in st.session_state.discovery_results if o.get("url") not in new_urls]
-
-        def render_opportunity(opp, i, allow_strategy=True, default_checked=True):
-            score = opp.get("total_score", "?")
-            title = opp.get("title", "Untitled")
-            sub = opp.get("subreddit", "unknown")
-            reasoning = opp.get("reasoning", "")
+    st.markdown("---")
+    if discovery_mode.startswith("Find subreddits"):
+        st.markdown("### Subreddits to Post In")
+        if not st.session_state.subreddit_results:
+            st.info("No subreddit targets yet.")
+        for i, opp in enumerate(st.session_state.subreddit_results):
             url = opp.get("url", "")
-            opp_type = opp.get("opportunity_type", "reply")
-
-            if isinstance(score, (int, float)):
-                score_color = "🟢" if score >= 16 else ("🟡" if score >= 12 else "🔴")
-            else:
-                score_color = "⚪"
-
-            opp_type_label = {
-                "new_post": " New Post",
-                "reply_post": "Reply to Thread",
-            }.get(opp_type, "Reply to Thread")
-
-            clean_sub = sub.lstrip("r/") if sub.startswith("r/") else sub
-            published_badge = " Published" if url in published_urls else ""
-
-            with st.expander(f"{score_color} [{score}/20] r/{clean_sub} — {title}{published_badge}"):
-                st.write(f"**Type:** {opp_type_label}")
-                st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | "
-                         f"**Intent:** {opp.get('intent', '?')}/10")
-                st.write(f"**Reasoning:** {reasoning}")
-
+            sub = opp.get("subreddit", "unknown")
+            score = opp.get("total_score", "?")
+            is_new = url in st.session_state.new_subreddit_urls
+            label = f"[{score}/20] r/{sub} — {opp.get('title', 'Create a post')}"
+            with st.expander(label, expanded=is_new):
+                st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
+                if url:
+                    st.write(f"[Open subreddit]({url})")
+                if opp.get("evidence"):
+                    st.write("**Evidence:**")
+                    for item in opp.get("evidence", []):
+                        st.write(f"- {item}")
+                key = f"select_subreddit_{i}"
+                if key not in st.session_state:
+                    st.session_state[key] = is_new
+                st.checkbox("Use this subreddit for post drafting", key=key)
+    else:
+        st.markdown("### Threads to Reply To")
+        if not st.session_state.discovery_results:
+            st.info("No reply opportunities yet.")
+        for i, opp in enumerate(st.session_state.discovery_results):
+            url = opp.get("url", "")
+            sub = opp.get("subreddit", "unknown")
+            score = opp.get("total_score", "?")
+            is_new = url in st.session_state.new_opportunity_urls
+            published_badge = " Published" if url in st.session_state.published_urls else ""
+            with st.expander(f"[{score}/20] r/{sub} — {opp.get('title', 'Untitled')}{published_badge}", expanded=is_new):
+                st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | **Intent:** {opp.get('intent', '?')}/10")
+                st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
                 if url:
                     st.write(f"[Open on Reddit]({url})")
-
-                if allow_strategy:
-                    key = f"select_{i}"
-                    if key not in st.session_state:
-                        st.session_state[key] = default_checked
-                    st.checkbox("Include in strategy", key=key)
-                else:
-                    st.caption("Published — not available for re-selection.")
-
-        if new_opps:
-            st.markdown(f"**Found {len(new_opps)} new opportunities:**")
-            for i, opp in enumerate(st.session_state.discovery_results):
-                if opp.get("url") in new_urls:
-                    is_published = opp.get("url") in published_urls
-                    render_opportunity(opp, i, allow_strategy=not is_published)
-
-        if old_opps:
-            st.markdown("---")
-            st.markdown("**Old Opportunities**")
-            for i, opp in enumerate(st.session_state.discovery_results):
-                if opp.get("url") not in new_urls:
-                    is_published = opp.get("url") in published_urls
-                    render_opportunity(opp, i, allow_strategy=not is_published, default_checked=False)
-
-        if not new_opps and not old_opps:
-            st.info("No opportunities found. Try a different time range or check your brief.")
-
-    elif run_discovery_btn:
-        st.info("No opportunities found. Try different search queries or check your brief.")
+                key = f"select_reply_{i}"
+                if key not in st.session_state:
+                    st.session_state[key] = is_new
+                st.checkbox("Use this thread for reply drafting", key=key, disabled=url in st.session_state.published_urls)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -423,25 +580,33 @@ with tab2:
 with tab3:
     st.subheader("Strategy & Content Generation")
 
-    if not st.session_state.discovery_results:
-        st.info("Run Discovery first to find opportunities.")
+    if not st.session_state.discovery_results and not st.session_state.subreddit_results:
+        st.info("Run Discovery first to find subreddits or reply opportunities.")
     else:
         # Collect selected opportunities
         selected = []
         published_urls = st.session_state.published_urls
+        for i, opp in enumerate(st.session_state.subreddit_results):
+            is_new = opp.get("url") in st.session_state.new_subreddit_urls
+            if st.session_state.get(f"select_subreddit_{i}", is_new):
+                selected.append(opp)
         for i, opp in enumerate(st.session_state.discovery_results):
             if opp.get("url") in published_urls:
                 continue
             is_new = opp.get("url") in st.session_state.new_opportunity_urls
-            if st.session_state.get(f"select_{i}", is_new):
+            if st.session_state.get(f"select_reply_{i}", is_new):
                 selected.append(opp)
 
-        st.write(f"**{len(selected)} opportunities selected** for strategy planning.")
+        post_count = sum(1 for item in selected if item.get("opportunity_type") == "new_post")
+        reply_count = len(selected) - post_count
+        st.write(f"**{post_count} subreddit posts** and **{reply_count} thread replies** selected for strategy planning.")
 
         # Step 1: Strategy
         if st.button("Generate Strategy", type="primary"):
             if not api_key:
                 st.error("Set your LLM API key in the sidebar.")
+            elif not selected:
+                st.warning("Select at least one subreddit or thread first.")
             else:
                 with st.spinner("Planning engagement strategy..."):
                     try:
@@ -563,122 +728,13 @@ with tab3:
                         save_current_state()
                         status.text(f"Generated {len(drafts)} new drafts!")
 
+        
         # Show drafts for editing
-        if st.session_state.drafts:
-            st.markdown("---")
-            st.subheader("Draft Review")
-
-            new_draft_urls = st.session_state.new_draft_urls
-            drafts_to_remove = []  # collect indices of rejected drafts to delete
-
-            for i, draft in enumerate(st.session_state.drafts):
-                if draft.get("rejected", False):
-                    continue  # skip already-rejected
-
-                is_new_draft = draft.get("opportunity", {}).get("url") in new_draft_urls
-                draft_type = draft.get("draft_type", "reply")
-                raw_sub = draft.get("subreddit", "unknown")
-                clean_sub = raw_sub.lstrip("r/") if raw_sub.startswith("r/") else raw_sub
-                type_emoji = "" if draft_type == "post" else ""
-                url_id = draft.get("opportunity", {}).get("url", str(i))
-                edit_key = f"editing_{url_id}"
-                is_approved = draft.get("approved", False)
-
-                # Section headers
-                if i == 0 and is_new_draft:
-                    pass  # will be under main header
-                elif not is_new_draft and (i == 0 or (i > 0 and st.session_state.drafts[i-1].get("opportunity", {}).get("url") in new_draft_urls)):
-                    st.markdown("---")
-                    st.markdown("**Old Drafts**")
-
-                raw_body = draft.get("body", "")
-                if isinstance(raw_body, str) and raw_body.strip().startswith("{"):
-                    try:
-                        import json as _json
-                        parsed = _json.loads(raw_body)
-                        raw_body = parsed.get("body", raw_body)
-                    except Exception:
-                        pass
-
-                draft_title = draft.get("title", "Draft")
-                published_badge = " ✓ Published" if draft.get("published", False) else ""
-                expander_label = f"{type_emoji} r/{clean_sub} — {draft_title[:60]}{published_badge}"
-
-                with st.expander(expander_label, expanded=not is_approved):
-                    if draft_type == "post":
-                        st.markdown(f"**Title:** {draft_title}")
-                        st.markdown("---")
-                    st.markdown(raw_body)
-
-                    st.markdown("")
-
-                    if is_approved:
-                        # Approved: just show status, no other buttons
-                        st.success("Approved — move to Publish tab.")
-                    else:
-                        col1, col2, col3, col4 = st.columns(4)
-
-                        with col1:
-                            if st.button("Approve", key=f"approve_btn_{url_id}", type="primary"):
-                                st.session_state.drafts[i]["approved"] = True
-                                save_current_state()
-                                st.rerun()
-
-                        with col2:
-                            is_editing = st.session_state.get(edit_key, False)
-                            edit_label = "Done Editing" if is_editing else "Edit"
-                            if st.button(edit_label, key=f"edit_btn_{url_id}"):
-                                st.session_state[edit_key] = not is_editing
-                                st.session_state[f"show_regen_{url_id}"] = False
-                                st.rerun()
-
-                        with col3:
-                            is_regen = st.session_state.get(f"show_regen_{url_id}", False)
-                            regen_label = "Cancel Regen" if is_regen else "Regenerate"
-                            if st.button(regen_label, key=f"regen_btn_{url_id}"):
-                                st.session_state[f"show_regen_{url_id}"] = not is_regen
-                                st.session_state[edit_key] = False
-                                st.rerun()
-
-                        with col4:
-                            if st.button("Reject", key=f"reject_btn_{url_id}"):
-                                # Mark rejected and delete strategy for this opportunity
-                                draft_url = draft.get("opportunity", {}).get("url", "")
-                                st.session_state.drafts[i]["rejected"] = True
-                                # Remove matching strategy
-                                st.session_state.strategy_results = [
-                                    s for s in st.session_state.strategy_results
-                                    if s.get("url", "") != draft_url
-                                ]
-                                save_current_state()
-                                st.rerun()
-
-                        if st.session_state.get(edit_key, False):
-                            new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{url_id}")
-                            st.session_state.drafts[i]["body"] = new_body
-                            if st.button("Save edits", key=f"save_edit_{url_id}"):
-                                st.session_state[edit_key] = False
-                                save_current_state()
-                                st.rerun()
-
-                        if st.session_state.get(f"show_regen_{url_id}", False):
-                            suggestion = st.text_area("How should we improve this draft?", placeholder="e.g. Make it shorter, focus more on feature X...", key=f"regen_input_{url_id}")
-                            if st.button("Generate New Draft", key=f"do_regen_{url_id}"):
-                                with st.spinner("Regenerating draft based on feedback..."):
-                                    from reddit_marketing.agents.content import generate_draft
-                                    try:
-                                        llm = get_llm(provider, model_name, api_key)
-                                        new_draft = generate_draft(llm, st.session_state.brief, draft.get("opportunity"), feedback=suggestion)
-                                        st.session_state.drafts[i] = new_draft
-                                        st.session_state[f"show_regen_{url_id}"] = False
-                                        save_current_state()
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Failed to regenerate: {e}")
-
+        render_draft_review_ui("Draft Review (Posts & Thread Replies)", allowed_types=["post", "reply"])
 
 # ═══════════════════════════════════════════════════════════════════════
 # TAB 4: Publish
+
 # ═══════════════════════════════════════════════════════════════════════
 
 with tab4:
@@ -723,9 +779,11 @@ with tab4:
                     if draft_type == "post":
                         reddit_url = get_submit_url(sub)
                         action_text = "Copy & Open Reddit Submit Page"
+                        default_published_url = ""
                     else:
                         reddit_url = get_reply_url(url) if url else f"https://www.reddit.com/r/{sub}"
                         action_text = "Copy & Open Reddit Thread"
+                        default_published_url = reddit_url
 
                     col1, col2 = st.columns(2)
                     url_id = opp.get("url", str(i))
@@ -740,40 +798,42 @@ with tab4:
                             success = copy_and_open(content_to_copy, reddit_url)
 
                             if success:
-                                # Mark as published and remove from publish tab
-                                st.session_state.drafts[i]["published"] = True
-                                draft_url = draft.get("opportunity", {}).get("url", "")
-                                if draft_url:
-                                    st.session_state.published_urls.add(draft_url)
-                                storage.log_published(
-                                    st.session_state.project_name, 
-                                    reddit_url, 
-                                    content_to_copy, 
-                                    draft_type, 
-                                    sub
-                                )
-                                save_current_state()
-                                st.success("Content copied! Reddit is opening in your browser. Just paste (Cmd+V) and submit.")
-                                st.rerun()
+                                st.success("Content copied. After submitting on Reddit, paste the final Reddit URL below and mark it published.")
                             else:
                                 st.warning("Couldn't copy to clipboard. Opening Reddit anyway...")
                                 st.link_button("Open Reddit Link", reddit_url)
-                                if st.button("Mark as Published (Manual)", key=f"manual_pub_{url_id}"):
-                                    st.session_state.drafts[i]["published"] = True
-                                    if draft_url:
-                                        st.session_state.published_urls.add(draft_url)
-                                    storage.log_published(
-                                        st.session_state.project_name, 
-                                        reddit_url, 
-                                        content_to_copy, 
-                                        draft_type, 
-                                        sub
-                                    )
-                                    save_current_state()
-                                    st.rerun()
 
                     with col2:
                         st.link_button("Open Reddit Link", reddit_url)
+
+                    published_url = st.text_input(
+                        "Final Reddit URL",
+                        value=default_published_url,
+                        placeholder="Paste the submitted post/comment URL here",
+                        key=f"published_url_{url_id}",
+                    )
+                    if st.button("Mark as Published", key=f"manual_pub_{url_id}"):
+                        final_url = published_url.strip() or reddit_url
+                        content_to_copy = body
+                        if draft_type == "post":
+                            content_to_copy = f"Title: {title}\n\n{body}"
+
+                        st.session_state.drafts[i]["published"] = True
+                        st.session_state.drafts[i]["published_url"] = final_url
+                        draft_url = draft.get("opportunity", {}).get("url", "")
+                        if draft_url:
+                            st.session_state.published_urls.add(draft_url)
+                        if final_url:
+                            st.session_state.published_urls.add(final_url)
+                        storage.log_published(
+                            st.session_state.project_name,
+                            final_url,
+                            content_to_copy,
+                            draft_type,
+                            sub,
+                        )
+                        save_current_state()
+                        st.rerun()
 
                     # Status
                     if draft.get("published", False):
@@ -793,3 +853,139 @@ with tab4:
     col1.metric("Total Drafts", total_drafts)
     col2.metric("Approved", approved_count)
     col3.metric("Published", published_count)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TAB 6: Monitor
+# ═══════════════════════════════════════════════════════════════════════
+
+with tab6:
+    st.subheader("Monitor Published Posts")
+    st.write("Fetch comments from published Reddit URLs, select useful replies, and draft responses for human review.")
+
+    published_items = storage.get_published_log(st.session_state.project_name)
+    monitorable_items = [
+        item for item in published_items
+        if item.get("url") and "reddit.com" in item.get("url", "") and "/submit" not in item.get("url", "")
+    ]
+
+    if not monitorable_items:
+        st.info("No monitorable Reddit URLs yet. Publish a draft and paste the final Reddit post/thread URL first.")
+    else:
+        st.markdown(f"**{len(monitorable_items)} published Reddit URLs available for monitoring.**")
+
+        options = [item.get("url") for item in monitorable_items if item.get("url")]
+        selected_urls = st.multiselect("Select URLs to monitor", options, default=options)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            max_comments = st.slider("Max comments per URL", min_value=5, max_value=50, value=20, step=5)
+        with col2:
+            sort_map = {"New Comments": "new", "Top Comments": "top", "Best Comments": "confidence"}
+            comment_sort_label = st.selectbox("Sort By", options=list(sort_map.keys()))
+            comment_sort = sort_map[comment_sort_label]
+
+        if st.button("Fetch & Rank Comments", type="primary"):
+            if not api_key:
+                st.error("Set your LLM API key in the sidebar.")
+            elif not selected_urls:
+                st.warning("Please select at least one URL to monitor.")
+            else:
+                with st.spinner("Fetching Reddit comments and ranking reply opportunities..."):
+                    try:
+                        all_comments = []
+                        seen_comment_ids = {
+                            item.get("comment", {}).get("id")
+                            for item in st.session_state.monitored_comments
+                        }
+                        selected_items = [item for item in monitorable_items if item.get("url") in selected_urls]
+                        for item in selected_items:
+                            comments = fetch_thread_comments_rss(item.get("url", ""), limit=max_comments, sort=comment_sort)
+                            for comment in comments:
+                                if comment.get("id") not in seen_comment_ids:
+                                    all_comments.append(comment)
+                                    seen_comment_ids.add(comment.get("id"))
+
+                        llm = get_llm(provider, model_name, api_key)
+                        ranked = score_comment_opportunities(llm, st.session_state.brief, all_comments)
+                        st.session_state.new_monitored_comment_ids = {
+                            item.get("comment", {}).get("id")
+                            for item in ranked
+                        }
+                        st.session_state.monitored_comments = ranked + st.session_state.monitored_comments
+                        save_current_state()
+                        if not ranked:
+                            st.info("No strong comment reply opportunities found.")
+                    except Exception as e:
+                        st.error(f"Monitoring failed: {e}")
+
+        if st.session_state.monitored_comments:
+            st.markdown("---")
+            st.subheader("Comment Opportunities")
+
+            selected_comments = []
+            for i, opp in enumerate(st.session_state.monitored_comments):
+                comment = opp.get("comment", {})
+
+                comment_id = comment.get("id", f"comment_{i}")
+                sub = opp.get("subreddit", "unknown")
+                score = opp.get("total_score", "?")
+                
+                comment_body = comment.get("body", "")
+                preview = (comment_body[:60] + "...") if len(comment_body) > 60 else comment_body
+                preview = preview.replace("\n", " ").strip()
+                title_label = preview or "Comment reply"
+                
+                if opp.get("url") in st.session_state.published_urls:
+                    title_label += " ✓ Published"
+                
+                is_new = comment_id in st.session_state.new_monitored_comment_ids
+
+                with st.expander(f"[{score}/20] r/{sub} — {title_label}", expanded=is_new):
+                    st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
+                    if comment.get("score", 0) > 0:
+                        st.write(f"**Reddit Upvotes:** {comment.get('score')}")
+                    if comment.get("permalink"):
+                        st.write(f"[Open comment]({comment.get('permalink')})")
+                    st.markdown("**Comment:**")
+                    st.write(comment.get("body", ""))
+
+                    select_key = f"monitor_select_{comment_id}"
+                    if select_key not in st.session_state:
+                        st.session_state[select_key] = False
+                    if st.checkbox("Draft a reply for review", key=select_key):
+                        selected_comments.append(opp)
+
+            if st.button("Generate Comment Reply Drafts"):
+                if not api_key:
+                    st.error("Set your LLM API key in the sidebar.")
+                elif not selected_comments:
+                    st.warning("Select at least one comment to draft a reply.")
+                else:
+                    with st.spinner("Drafting comment replies..."):
+                        llm = get_llm(provider, model_name, api_key)
+                        drafts = []
+                        for opp in selected_comments:
+                            try:
+                                drafts.append(generate_comment_reply_draft(llm, st.session_state.brief, opp))
+                            except Exception as e:
+                                st.warning(f"Failed to draft reply for {opp.get('url', 'comment')}: {e}")
+
+                        new_draft_keys = {
+                            (d.get("opportunity", {}).get("url"), d.get("subreddit"))
+                            for d in drafts
+                        }
+                        existing_drafts = [
+                            d for d in st.session_state.drafts
+                            if (d.get("opportunity", {}).get("url"), d.get("subreddit")) not in new_draft_keys
+                        ]
+                        st.session_state.new_draft_urls = {
+                            d.get("opportunity", {}).get("url")
+                            for d in drafts
+                        }
+                        st.session_state.drafts = drafts + existing_drafts
+                        save_current_state()
+                        st.success("Comment reply drafts generated successfully!")
+
+        render_draft_review_ui("Comment Reply Drafts", allowed_types=["comment_reply"])
+

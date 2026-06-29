@@ -1,7 +1,6 @@
 """
 Discovery Agent
 
-Uses Tavily to search Reddit posts/threads, then the LLM scores and ranks them.
 """
 
 import re
@@ -21,11 +20,43 @@ class ScoredOpportunity(BaseModel):
     intent: int
     total_score: int
     reasoning: str
-    opportunity_type: str = Field(description="'new_post' or 'reply_post'")
+    opportunity_type: str = Field(description='Must be "reply_post"')
 
 
 class OpportunityList(BaseModel):
     opportunities: list[ScoredOpportunity]
+
+
+class SubredditOpportunity(BaseModel):
+    title: str = Field(description="A short recommendation title for this subreddit")
+    url: str = Field(description="Subreddit URL")
+    subreddit: str = Field(description="Subreddit name only — NO r/ prefix")
+    relevance: int
+    intent: int
+    total_score: int
+    reasoning: str
+    opportunity_type: str = Field(description='Must be "new_post"')
+    evidence: list[str] = Field(description="2-4 examples from discovered threads that justify posting here")
+
+
+class SubredditOpportunityList(BaseModel):
+    opportunities: list[SubredditOpportunity]
+
+
+class CommentOpportunity(BaseModel):
+    id: str
+    title: str
+    url: str
+    subreddit: str
+    relevance: int
+    intent: int
+    total_score: int
+    reasoning: str
+    opportunity_type: str = Field(description='Must be "comment_reply"')
+
+
+class CommentOpportunityList(BaseModel):
+    opportunities: list[CommentOpportunity]
 
 
 DISCOVERY_SYSTEM_PROMPT = """You are a Reddit marketing strategist. Your job is to find the best opportunities to promote a product on Reddit in a helpful, non-spammy way.
@@ -41,7 +72,6 @@ For each item, score it on two dimensions (0-10):
 Also provide:
 - **reasoning**: A one-sentence explanation of why this is (or isn't) a good opportunity.
 - **opportunity_type**: 
-  - "new_post" if we should create a new original post in this subreddit
   - "reply_post" if we should reply directly to this thread/post
 
 IMPORTANT: The subreddit name in your response must be ONLY the subreddit name with NO r/ prefix.
@@ -55,9 +85,41 @@ Respond by strictly following the requested JSON schema. Each opportunity must h
 - intent: 0-10
 - total_score: sum of the above (0-20)
 - reasoning: one-sentence explanation
-- opportunity_type: "new_post" or "reply_post"
+- opportunity_type: "reply_post"
 
 Sort your internal list by total_score descending. Only include opportunities with total_score >= 8."""
+
+
+SUBREDDIT_DISCOVERY_PROMPT = """You are choosing where a product should create an original Reddit post.
+
+You will receive a project brief and evidence from Reddit threads already discovered by search.
+Recommend subreddits where an original post would be useful, welcome, and relevant.
+
+Score each subreddit:
+- relevance: how aligned the community is with the product and target audience (0-10)
+- intent: whether recent threads show people actively discussing problems the product helps with (0-10)
+
+Rules:
+- Prefer subreddits supported by multiple strong evidence items.
+- Avoid communities where an original post would feel like pure self-promotion.
+- The output opportunity_type must be "new_post".
+- The URL should be https://www.reddit.com/r/<subreddit>/
+- Subreddit must be name only, no r/ prefix.
+- Only include opportunities with total_score >= 10.
+
+Respond by strictly following the requested JSON schema."""
+
+
+COMMENT_DISCOVERY_PROMPT = """You are monitoring comments on Reddit posts for useful, non-spammy follow-up opportunities.
+
+Score each comment:
+- relevance: does the comment ask something or raise a point related to the product? (0-10)
+- intent: would a helpful reply from the poster be useful here? (0-10)
+
+Only select comments that deserve an actual human-reviewed reply. Skip low-effort, hostile, already-answered,
+or purely congratulatory comments.
+
+Respond by strictly following the requested JSON schema. opportunity_type must be "comment_reply"."""
 
 
 def _clean_subreddit(sub: str) -> str:
@@ -132,6 +194,7 @@ def score_opportunities(llm, brief, raw_opportunities):
         # Safety net: recompute total_score from sub-scores in case AI gets it wrong
         for item in scored:
             item["total_score"] = item.get("relevance", 0) + item.get("intent", 0)
+            item["opportunity_type"] = "reply_post"
             if "subreddit" in item:
                 item["subreddit"] = _clean_subreddit(item["subreddit"])
 
@@ -142,29 +205,203 @@ def score_opportunities(llm, brief, raw_opportunities):
         return []
 
 
-def run_discovery(llm, tavily_api_key, brief, queries, max_results_per_query=5, time_range="month"):
+def discover_subreddit_opportunities(llm, brief, reddit_evidence, max_subreddits=5):
     """
-    Discovery pipeline:
-    1. Search Reddit via Tavily using provided queries.
-    2. Score and rank all results.
+    Convert Reddit search evidence into subreddit-level opportunities for original posts.
+    """
+    if not reddit_evidence:
+        return []
 
-    Returns a list of scored_opportunities.
-    """
-    from reddit_marketing.reddit_search import search_reddit
+    by_subreddit = {}
+    for opp in reddit_evidence:
+        sub = _clean_subreddit(opp.get("subreddit", "unknown"))
+        if not sub or sub == "unknown":
+            continue
+        by_subreddit.setdefault(sub, []).append(opp)
+
+    evidence_text = ""
+    for sub, items in sorted(
+        by_subreddit.items(),
+        key=lambda kv: sum(i.get("total_score", 0) for i in kv[1]),
+        reverse=True,
+    )[:12]:
+        evidence_text += f"\n## r/{sub}\n"
+        for item in sorted(items, key=lambda x: x.get("total_score", 0), reverse=True)[:4]:
+            evidence_text += (
+                f"- {item.get('title', 'Untitled')} "
+                f"(score {item.get('total_score', '?')}, type {item.get('opportunity_type', 'reply_post')})\n"
+                f"  URL: {item.get('url', '')}\n"
+                f"  Why: {item.get('reasoning', '')}\n"
+            )
+
+    messages = [
+        SystemMessage(content=SUBREDDIT_DISCOVERY_PROMPT),
+        HumanMessage(content=(
+            f"Project Brief:\n{brief.to_prompt_str()}\n\n"
+            f"Discovered Reddit evidence by subreddit:\n{evidence_text}"
+        )),
+    ]
+
+    try:
+        structured_llm = llm.with_structured_output(SubredditOpportunityList)
+        response = structured_llm.invoke(messages)
+        opportunities = [opp.model_dump() for opp in response.opportunities]
+        for item in opportunities:
+            item["subreddit"] = _clean_subreddit(item.get("subreddit", "unknown"))
+            item["total_score"] = item.get("relevance", 0) + item.get("intent", 0)
+            item["opportunity_type"] = "new_post"
+            item["type"] = "post"
+            item["source"] = "subreddit_discovery"
+            item.setdefault("url", f"https://www.reddit.com/r/{item['subreddit']}/")
+            item.setdefault("title", f"Create a post in r/{item['subreddit']}")
+
+        filtered = [s for s in opportunities if s.get("total_score", 0) >= 10]
+        return sorted(filtered, key=lambda x: x.get("total_score", 0), reverse=True)[:max_subreddits]
+    except Exception as e:
+        print(f"Error discovering subreddits: {e}")
+        return []
+
+
+def collect_reddit_evidence(tavily_api_key, queries, max_results_per_query=5, time_range="month", search_method="reddit_json"):
+    """Search Reddit and return normalized raw evidence without LLM scoring."""
+    from reddit_marketing.reddit_search import search_reddit, search_reddit_json
 
     all_results = []
     seen_urls = set()
 
     for query in queries:
-        results = search_reddit(
-            tavily_api_key, query,
-            max_results=max_results_per_query,
-            time_range=time_range,
-        )
-        for r in results:
-            if r["url"] not in seen_urls:
-                seen_urls.add(r["url"])
-                all_results.append(r)
+        if search_method == "reddit_json":
+            results = search_reddit_json(query, max_results=max_results_per_query, time_range=time_range)
 
+        else:
+            results = search_reddit(
+                tavily_api_key,
+                query,
+                max_results=max_results_per_query,
+                time_range=time_range,
+            )
+
+        if not results and search_method != "tavily" and tavily_api_key:
+            import streamlit as st
+            st.warning(f"Reddit JSON rate-limited for query: '{query}'. Falling back to Tavily...")
+            results = search_reddit(
+                tavily_api_key,
+                query,
+                max_results=max_results_per_query,
+                time_range=time_range,
+            )
+
+        for result in results:
+            url = result.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append(result)
+
+    return all_results
+
+
+def score_comment_opportunities(llm, brief, comments):
+    """Score monitored comments and return the best reply opportunities."""
+    if not comments:
+        return []
+
+    comments_text = ""
+    for i, comment in enumerate(comments, 1):
+        comments_text += (
+            f"\n--- Comment {i} ---\n"
+            f"ID: {comment.get('id', '')}\n"
+            f"Subreddit: r/{comment.get('subreddit', 'unknown')}\n"
+            f"Post title: {comment.get('post_title', '')}\n"
+            f"Comment URL: {comment.get('permalink', '')}\n"
+            f"Author: {comment.get('author', '')}\n"
+            f"Score: {comment.get('score', 0)}\n"
+            f"Comment: {comment.get('body', '')[:700]}\n"
+        )
+
+    messages = [
+        SystemMessage(content=COMMENT_DISCOVERY_PROMPT),
+        HumanMessage(content=(
+            f"Project Brief:\n{brief.to_prompt_str()}\n\n"
+            f"Comments to triage:\n{comments_text}"
+        )),
+    ]
+
+    try:
+        structured_llm = llm.with_structured_output(CommentOpportunityList)
+        response = structured_llm.invoke(messages)
+        selected = [opp.model_dump() for opp in response.opportunities]
+        comments_by_id = {c.get("id"): c for c in comments}
+        enriched = []
+        for item in selected:
+            comment = comments_by_id.get(item.get("id"), {})
+            item["subreddit"] = _clean_subreddit(item.get("subreddit") or comment.get("subreddit", "unknown"))
+            item["total_score"] = item.get("relevance", 0) + item.get("intent", 0)
+            item["opportunity_type"] = "comment_reply"
+            item["type"] = "comment_reply"
+            item["source"] = "reddit_json_monitor"
+            item["comment"] = comment
+            item["url"] = item.get("url") or comment.get("permalink", "")
+            item["title"] = item.get("title") or f"Reply to comment on {comment.get('post_title', 'Reddit post')}"
+            enriched.append(item)
+
+        return sorted(
+            [s for s in enriched if s.get("total_score", 0) >= 8],
+            key=lambda x: x.get("total_score", 0),
+            reverse=True,
+        )
+    except Exception as e:
+        print(f"Error scoring comments: {e}")
+        return []
+
+
+def run_discovery(
+    llm,
+    tavily_api_key,
+    brief,
+    queries,
+    max_results_per_query=5,
+    time_range="month",
+    search_method="tavily",
+    rss_subreddits=None,
+):
+    """
+    Discovery pipeline:
+    1. Search Reddit via Tavily, Reddit JSON, 
+    2. Score and rank all results.
+
+    Returns a list of scored_opportunities.
+    """
+    all_results = collect_reddit_evidence(
+        tavily_api_key,
+        queries,
+        max_results_per_query=max_results_per_query,
+        time_range=time_range,
+        search_method=search_method,
+    )
     scored = score_opportunities(llm, brief, all_results)
     return scored
+
+
+def run_subreddit_discovery(
+    llm,
+    tavily_api_key,
+    brief,
+    queries,
+    max_results_per_query=5,
+    time_range="month",
+    search_method="reddit_json",
+    rss_subreddits=None,
+    max_subreddits=5,
+):
+    """
+    Separate pipeline for finding subreddits to create original posts in.
+    It searches Reddit for evidence, then returns only subreddit opportunities.
+    """
+    evidence = collect_reddit_evidence(
+        tavily_api_key,
+        queries,
+        max_results_per_query=max_results_per_query,
+        time_range=time_range,
+        search_method=search_method,
+    )
+    return discover_subreddit_opportunities(llm, brief, evidence, max_subreddits=max_subreddits)
