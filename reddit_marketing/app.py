@@ -243,6 +243,7 @@ def render_draft_review_ui(title="Draft Review", allowed_types=None):
         safe_url_id = hashlib.md5(url_id.encode('utf-8')).hexdigest()
         edit_key = f"editing_{safe_url_id}"
         is_approved = draft.get("approved", False)
+        draft_version = draft.get("version", 0)
 
         raw_body = draft.get("body", "")
         if isinstance(raw_body, str) and raw_body.strip().startswith("{"):
@@ -266,14 +267,17 @@ def render_draft_review_ui(title="Draft Review", allowed_types=None):
             if draft_type == "post":
                 st.markdown(f"**Title:** {draft_title}")
                 st.markdown("---")
-            st.markdown(raw_body)
-
-            st.markdown("")
-
+            
             if is_approved:
+                st.markdown(raw_body)
                 st.success("Approved — move to Publish tab.")
             else:
-                col1, col2, col3, col4 = st.columns(4)
+                new_body = st.text_area("Edit Draft Content:", value=raw_body, height=250, key=f"draft_body_{safe_url_id}_v{draft_version}")
+                if new_body != raw_body:
+                    st.session_state.drafts[i]["body"] = new_body
+                    save_current_state()
+
+                col1, col2, col3 = st.columns(3)
 
                 with col1:
                     if st.button("Approve", key=f"approve_btn_{safe_url_id}", type="primary"):
@@ -282,22 +286,13 @@ def render_draft_review_ui(title="Draft Review", allowed_types=None):
                         st.rerun()
 
                 with col2:
-                    is_editing = st.session_state.get(edit_key, False)
-                    edit_label = "Done Editing" if is_editing else "Edit"
-                    if st.button(edit_label, key=f"edit_btn_{safe_url_id}"):
-                        st.session_state[edit_key] = not is_editing
-                        st.session_state[f"show_regen_{safe_url_id}"] = False
-                        st.rerun()
-
-                with col3:
                     is_regen = st.session_state.get(f"show_regen_{safe_url_id}", False)
                     regen_label = "Cancel Regen" if is_regen else "Regenerate"
                     if st.button(regen_label, key=f"regen_btn_{safe_url_id}"):
                         st.session_state[f"show_regen_{safe_url_id}"] = not is_regen
-                        st.session_state[edit_key] = False
                         st.rerun()
 
-                with col4:
+                with col3:
                     if st.button("Reject", key=f"reject_btn_{safe_url_id}"):
                         st.session_state.drafts[i]["rejected"] = True
                         draft_url = draft.get("opportunity", {}).get("url", "")
@@ -305,14 +300,6 @@ def render_draft_review_ui(title="Draft Review", allowed_types=None):
                             s for s in st.session_state.strategy_results
                             if s.get("url", "") != draft_url
                         ]
-                        save_current_state()
-                        st.rerun()
-
-                if st.session_state.get(edit_key, False):
-                    new_body = st.text_area("Content", value=raw_body, height=250, key=f"draft_body_{safe_url_id}")
-                    st.session_state.drafts[i]["body"] = new_body
-                    if st.button("Save edits", key=f"save_edit_{safe_url_id}"):
-                        st.session_state[edit_key] = False
                         save_current_state()
                         st.rerun()
 
@@ -324,8 +311,13 @@ def render_draft_review_ui(title="Draft Review", allowed_types=None):
                             try:
                                 llm = get_llm(provider, model_name, api_key)
                                 new_draft = generate_draft(llm, st.session_state.brief, draft.get("opportunity"), feedback=suggestion)
+                                new_draft["version"] = draft_version + 1
                                 st.session_state.drafts[i] = new_draft
                                 st.session_state[f"show_regen_{safe_url_id}"] = False
+                                
+                                if f"regen_input_{safe_url_id}" in st.session_state:
+                                    del st.session_state[f"regen_input_{safe_url_id}"]
+                                    
                                 save_current_state()
                                 st.rerun()
                             except Exception as e:
@@ -378,6 +370,9 @@ with tab1:
     # Show current brief as the LLM sees it
     with st.expander("Preview: How the LLM sees your brief"):
         st.code(st.session_state.brief.to_prompt_str())
+
+    st.markdown("---")
+    st.info(" **Next Step:** Go to the **Discovery** tab at the top to find subreddits and threads.")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -446,28 +441,29 @@ with tab2:
         horizontal=True,
     )
 
-    col_opts1, col_opts2, col_opts3, col_opts4 = st.columns(4)
-    with col_opts1:
-        time_range = st.selectbox(
-            "Time Range",
-            options=["day", "week", "month", "year", "all"],
-            index=2,
-            format_func=lambda x: "Past 24 hours" if x == "day" else f"Past {x}" if x != "all" else "Any time",
-        )
-    with col_opts2:
-        max_total = st.slider("Max total results", min_value=1, max_value=30, value=10)
-    with col_opts3:
-        max_per_query = st.slider("Max per query", min_value=1, max_value=20, value=5)
-    with col_opts4:
-        search_method = st.selectbox(
-            "Search Source",
-            options=["reddit_json", "tavily"],
-            index=0,
-            format_func=lambda x: {
-                "reddit_json": "Reddit JSON",
-                "tavily": "Tavily",
-            }[x],
-        )
+    with st.expander(" Advanced Search Settings"):
+        col_opts1, col_opts2, col_opts3, col_opts4 = st.columns(4)
+        with col_opts1:
+            time_range = st.selectbox(
+                "Time Range",
+                options=["day", "week", "month", "year", "all"],
+                index=2,
+                format_func=lambda x: "Past 24 hours" if x == "day" else f"Past {x}" if x != "all" else "Any time",
+            )
+        with col_opts2:
+            max_total = st.slider("Max total results", min_value=1, max_value=30, value=10)
+        with col_opts3:
+            max_per_query = st.slider("Max per query", min_value=1, max_value=20, value=5)
+        with col_opts4:
+            search_method = st.selectbox(
+                "Search Source",
+                options=["reddit_json", "tavily"],
+                index=0,
+                format_func=lambda x: {
+                    "reddit_json": "Reddit JSON",
+                    "tavily": "Tavily",
+                }[x],
+            )
 
     rss_subreddits = []
 
@@ -540,21 +536,33 @@ with tab2:
             url = opp.get("url", "")
             sub = opp.get("subreddit", "unknown")
             score = opp.get("total_score", "?")
+            try:
+                score_num = float(score)
+                score_dot = "🟢" if score_num >= 15 else "🟡" if score_num >= 10 else "🔴"
+            except:
+                score_dot = "⚪"
+            
             is_new = url in st.session_state.new_subreddit_urls
-            new_badge = " 🟢 NEW" if is_new else ""
-            label = f"[{score}/20] r/{sub} — {opp.get('title', 'Create a post')}{new_badge}"
-            with st.expander(label, expanded=is_new):
-                st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
-                if url:
-                    st.write(f"[Open subreddit]({url})")
-                if opp.get("evidence"):
-                    st.write("**Evidence:**")
-                    for item in opp.get("evidence", []):
-                        st.write(f"- {item}")
-                key = f"select_subreddit_{i}"
-                if key not in st.session_state:
-                    st.session_state[key] = is_new
-                st.checkbox("Use this subreddit for post drafting", key=key)
+            new_badge = "  NEW" if is_new else ""
+            
+            key = f"select_subreddit_{i}"
+            if key not in st.session_state:
+                st.session_state[key] = is_new
+                
+            col1, col2 = st.columns([0.05, 0.95])
+            with col1:
+                st.write("") # spacer to align checkbox with expander vertically
+                st.checkbox("Select subreddit", key=key, label_visibility="collapsed")
+            with col2:
+                label = f"{score_dot} [{score}/20] r/{sub} — {opp.get('title', 'Create a post')}{new_badge}"
+                with st.expander(label, expanded=is_new):
+                    st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
+                    if url:
+                        st.write(f"[Open subreddit]({url})")
+                    if opp.get("evidence"):
+                        st.write("**Evidence:**")
+                        for item in opp.get("evidence", []):
+                            st.write(f"- {item}")
     else:
         st.markdown("### Threads to Reply To")
         if not st.session_state.discovery_results:
@@ -563,18 +571,34 @@ with tab2:
             url = opp.get("url", "")
             sub = opp.get("subreddit", "unknown")
             score = opp.get("total_score", "?")
+            try:
+                score_num = float(score)
+                score_dot = "🟢" if score_num >= 15 else "🟡" if score_num >= 10 else "🔴"
+            except:
+                score_dot = "⚪"
+                
             is_new = url in st.session_state.new_opportunity_urls
-            new_badge = " 🟢 NEW" if is_new else ""
+            new_badge = " ✨ NEW" if is_new else ""
             published_badge = " ✓ Published" if url in st.session_state.published_urls else ""
-            with st.expander(f"[{score}/20] r/{sub} — {opp.get('title', 'Untitled')}{published_badge}{new_badge}", expanded=is_new):
-                st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | **Intent:** {opp.get('intent', '?')}/10")
-                st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
-                if url:
-                    st.write(f"[Open on Reddit]({url})")
-                key = f"select_reply_{i}"
-                if key not in st.session_state:
-                    st.session_state[key] = is_new
-                st.checkbox("Use this thread for reply drafting", key=key, disabled=url in st.session_state.published_urls)
+            
+            key = f"select_reply_{i}"
+            if key not in st.session_state:
+                st.session_state[key] = is_new
+                
+            col1, col2 = st.columns([0.05, 0.95])
+            with col1:
+                st.write("") # spacer to align checkbox with expander vertically
+                st.checkbox("Select thread", key=key, label_visibility="collapsed", disabled=url in st.session_state.published_urls)
+            with col2:
+                with st.expander(f"{score_dot} [{score}/20] r/{sub} — {opp.get('title', 'Untitled')}{published_badge}{new_badge}", expanded=is_new):
+                    st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | **Intent:** {opp.get('intent', '?')}/10")
+                    st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
+                    if url:
+                        st.write(f"[Open on Reddit]({url})")
+                        
+    if st.session_state.discovery_results or st.session_state.subreddit_results:
+        st.markdown("---")
+        st.info("👉 **Next Step:** After selecting opportunities, go to the **Strategy & Content** tab to generate drafts.")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -735,6 +759,10 @@ with tab3:
         
         # Show drafts for editing
         render_draft_review_ui("Draft Review (Posts & Thread Replies)", allowed_types=["post", "reply"])
+        
+        if st.session_state.drafts:
+            st.markdown("---")
+            st.info("👉 **Next Step:** Once you have approved your drafts, go to the **Publish** tab to post them on Reddit.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # TAB 4: Publish
