@@ -301,57 +301,29 @@ def collect_reddit_evidence(tavily_api_key, queries, max_results_per_query=5, ti
 
 
 def score_comment_opportunities(llm, brief, comments):
-    """Score monitored comments and return the best reply opportunities."""
+    """Wrap all fetched comments into opportunity format without any LLM scoring or cutoff."""
     if not comments:
         return []
 
-    comments_text = ""
-    for i, comment in enumerate(comments, 1):
-        comments_text += (
-            f"\n--- Comment {i} ---\n"
-            f"ID: {comment.get('id', '')}\n"
-            f"Subreddit: r/{comment.get('subreddit', 'unknown')}\n"
-            f"Post title: {comment.get('post_title', '')}\n"
-            f"Comment URL: {comment.get('permalink', '')}\n"
-            f"Author: {comment.get('author', '')}\n"
-            f"Score: {comment.get('score', 0)}\n"
-            f"Comment: {comment.get('body', '')[:700]}\n"
-        )
+    enriched = []
+    for comment in comments:
+        item = {
+            "id": comment.get("id", ""),
+            "subreddit": _clean_subreddit(comment.get("subreddit", "unknown")),
+            "total_score": comment.get("score", 0),
+            "opportunity_type": "comment_reply",
+            "type": "comment_reply",
+            "source": "reddit_json_monitor",
+            "comment": comment,
+            "url": comment.get("permalink", ""),
+            "title": f"Reply to comment on {comment.get('post_title', 'Reddit post')}",
+            "reasoning": "",
+            "relevance": 0,
+            "intent": 0,
+        }
+        enriched.append(item)
 
-    messages = [
-        SystemMessage(content=COMMENT_DISCOVERY_PROMPT),
-        HumanMessage(content=(
-            f"Project Brief:\n{brief.to_prompt_str()}\n\n"
-            f"Comments to triage:\n{comments_text}"
-        )),
-    ]
-
-    try:
-        structured_llm = llm.with_structured_output(CommentOpportunityList)
-        response = structured_llm.invoke(messages)
-        selected = [opp.model_dump() for opp in response.opportunities]
-        comments_by_id = {c.get("id"): c for c in comments}
-        enriched = []
-        for item in selected:
-            comment = comments_by_id.get(item.get("id"), {})
-            item["subreddit"] = _clean_subreddit(item.get("subreddit") or comment.get("subreddit", "unknown"))
-            item["total_score"] = item.get("relevance", 0) + item.get("intent", 0)
-            item["opportunity_type"] = "comment_reply"
-            item["type"] = "comment_reply"
-            item["source"] = "reddit_json_monitor"
-            item["comment"] = comment
-            item["url"] = item.get("url") or comment.get("permalink", "")
-            item["title"] = item.get("title") or f"Reply to comment on {comment.get('post_title', 'Reddit post')}"
-            enriched.append(item)
-
-        return sorted(
-            [s for s in enriched if s.get("total_score", 0) >= 8],
-            key=lambda x: x.get("total_score", 0),
-            reverse=True,
-        )
-    except Exception as e:
-        print(f"Error scoring comments: {e}")
-        return []
+    return enriched
 
 
 def run_discovery(

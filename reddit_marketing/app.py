@@ -446,7 +446,7 @@ with tab2:
         horizontal=True,
     )
 
-    col_opts1, col_opts2, col_opts3 = st.columns(3)
+    col_opts1, col_opts2, col_opts3, col_opts4 = st.columns(4)
     with col_opts1:
         time_range = st.selectbox(
             "Time Range",
@@ -455,8 +455,10 @@ with tab2:
             format_func=lambda x: "Past 24 hours" if x == "day" else f"Past {x}" if x != "all" else "Any time",
         )
     with col_opts2:
-        max_total = st.slider("Max results", min_value=1, max_value=30, value=10)
+        max_total = st.slider("Max total results", min_value=1, max_value=30, value=10)
     with col_opts3:
+        max_per_query = st.slider("Max per query", min_value=1, max_value=20, value=5)
+    with col_opts4:
         search_method = st.selectbox(
             "Search Source",
             options=["reddit_json", "tavily"],
@@ -494,7 +496,7 @@ with tab2:
                             tavily_key,
                             st.session_state.brief,
                             final_queries,
-                            max_results_per_query=5,
+                            max_results_per_query=max_per_query,
                             time_range=tr_param,
                             search_method=search_method,
                             rss_subreddits=rss_subreddits,
@@ -511,7 +513,7 @@ with tab2:
                             tavily_key,
                             st.session_state.brief,
                             final_queries,
-                            max_results_per_query=5,
+                            max_results_per_query=max_per_query,
                             time_range=tr_param,
                             search_method=search_method,
                             rss_subreddits=rss_subreddits,
@@ -539,7 +541,8 @@ with tab2:
             sub = opp.get("subreddit", "unknown")
             score = opp.get("total_score", "?")
             is_new = url in st.session_state.new_subreddit_urls
-            label = f"[{score}/20] r/{sub} — {opp.get('title', 'Create a post')}"
+            new_badge = " 🟢 NEW" if is_new else ""
+            label = f"[{score}/20] r/{sub} — {opp.get('title', 'Create a post')}{new_badge}"
             with st.expander(label, expanded=is_new):
                 st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
                 if url:
@@ -561,8 +564,9 @@ with tab2:
             sub = opp.get("subreddit", "unknown")
             score = opp.get("total_score", "?")
             is_new = url in st.session_state.new_opportunity_urls
-            published_badge = " Published" if url in st.session_state.published_urls else ""
-            with st.expander(f"[{score}/20] r/{sub} — {opp.get('title', 'Untitled')}{published_badge}", expanded=is_new):
+            new_badge = " 🟢 NEW" if is_new else ""
+            published_badge = " ✓ Published" if url in st.session_state.published_urls else ""
+            with st.expander(f"[{score}/20] r/{sub} — {opp.get('title', 'Untitled')}{published_badge}{new_badge}", expanded=is_new):
                 st.write(f"**Relevance:** {opp.get('relevance', '?')}/10 | **Intent:** {opp.get('intent', '?')}/10")
                 st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
                 if url:
@@ -879,43 +883,39 @@ with tab6:
 
         col1, col2 = st.columns(2)
         with col1:
-            max_comments = st.slider("Max comments per URL", min_value=5, max_value=50, value=20, step=5)
+            max_comments = st.slider("Max comments per URL", min_value=5, max_value=100, value=20, step=5)
         with col2:
             sort_map = {"New Comments": "new", "Top Comments": "top", "Best Comments": "confidence"}
             comment_sort_label = st.selectbox("Sort By", options=list(sort_map.keys()))
             comment_sort = sort_map[comment_sort_label]
 
-        if st.button("Fetch & Rank Comments", type="primary"):
-            if not api_key:
-                st.error("Set your LLM API key in the sidebar.")
-            elif not selected_urls:
+        if st.button("Fetch Comments", type="primary"):
+            if not selected_urls:
                 st.warning("Please select at least one URL to monitor.")
             else:
-                with st.spinner("Fetching Reddit comments and ranking reply opportunities..."):
+                with st.spinner("Fetching Reddit comments..."):
                     try:
                         all_comments = []
-                        seen_comment_ids = {
-                            item.get("comment", {}).get("id")
-                            for item in st.session_state.monitored_comments
-                        }
                         selected_items = [item for item in monitorable_items if item.get("url") in selected_urls]
                         for item in selected_items:
                             comments = fetch_thread_comments_rss(item.get("url", ""), limit=max_comments, sort=comment_sort)
-                            for comment in comments:
-                                if comment.get("id") not in seen_comment_ids:
-                                    all_comments.append(comment)
-                                    seen_comment_ids.add(comment.get("id"))
+                            all_comments.extend(comments)
+
+                        # Clear ALL previous comment opportunities before adding new ones
+                        st.session_state.monitored_comments = []
 
                         llm = get_llm(provider, model_name, api_key)
-                        ranked = score_comment_opportunities(llm, st.session_state.brief, all_comments)
+                        new_opps = score_comment_opportunities(llm, st.session_state.brief, all_comments)
                         st.session_state.new_monitored_comment_ids = {
                             item.get("comment", {}).get("id")
-                            for item in ranked
+                            for item in new_opps
                         }
-                        st.session_state.monitored_comments = ranked + st.session_state.monitored_comments
+                        st.session_state.monitored_comments = new_opps + st.session_state.monitored_comments
                         save_current_state()
-                        if not ranked:
-                            st.info("No strong comment reply opportunities found.")
+                        if new_opps:
+                            st.success(f"Found {len(new_opps)} comment(s).")
+                        else:
+                            st.info("No comments found for the selected URLs.")
                     except Exception as e:
                         st.error(f"Monitoring failed: {e}")
 
@@ -941,10 +941,7 @@ with tab6:
                 
                 is_new = comment_id in st.session_state.new_monitored_comment_ids
 
-                with st.expander(f"[{score}/20] r/{sub} — {title_label}", expanded=is_new):
-                    st.write(f"**Reasoning:** {opp.get('reasoning', '')}")
-                    if comment.get("score", 0) > 0:
-                        st.write(f"**Reddit Upvotes:** {comment.get('score')}")
+                with st.expander(f"r/{sub} — {title_label}", expanded=is_new):
                     if comment.get("permalink"):
                         st.write(f"[Open comment]({comment.get('permalink')})")
                     st.markdown("**Comment:**")

@@ -61,14 +61,20 @@ def _reddit_json_url(url: str) -> str:
     return urlunparse((parsed.scheme or "https", parsed.netloc or "www.reddit.com", path, "", parsed.query, ""))
 
 
-def _reddit_rss_url(url: str, sort: str = None) -> str:
+def _reddit_rss_url(url: str, sort: str = None, limit: int = None) -> str:
     """Convert a reddit.com URL into its .rss endpoint."""
     clean = url.split("#")[0].split("?")[0] 
     parsed = urlparse(clean)
     path = parsed.path.rstrip("/")
     if not path.endswith(".rss"):
-        path = f"{path}/.rss"
-    query = f"sort={sort}" if sort else ""
+        path = f"{path}.rss"
+    query_parts = []
+    if sort:
+        query_parts.append(f"sort={sort}")
+    if limit:
+        # Add 1 to limit to account for the post itself which is returned as the first entry
+        query_parts.append(f"limit={limit + 1}")
+    query = "&".join(query_parts)
     return urlunparse((parsed.scheme or "https", parsed.netloc or "www.reddit.com", path, "", query, ""))
 
 
@@ -344,9 +350,9 @@ def fetch_thread_comments_rss(post_url: str, limit: int = 50, sort: str = None) 
         return []
 
     try:
-        xml_data = _request_text(_reddit_rss_url(post_url, sort=sort))
-    except Exception:
-        return []
+        xml_data = _request_text(_reddit_rss_url(post_url, sort=sort, limit=limit))
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch Reddit RSS: {e}")
 
     try:
         root = ET.fromstring(xml_data)
